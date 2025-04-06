@@ -9,3 +9,4 @@ This tool adapts over time based on your system’s activity and usage patterns,
     Optimize performance
 
     Keep your system secure
+it a python sccript
