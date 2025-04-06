@@ -1,0 +1,1033 @@
+import tkinter as tk
+from tkinter import messagebox, ttk
+import subprocess
+import logging
+import numpy as np
+import random
+import threading
+import time
+import os
+import socket
+import pickle
+from datetime import datetime
+from collections import deque
+
+# Try to import psutil, with a fallback if it's not installed
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+    print("Warning: 'psutil' library not found. System health metrics will be limited. Install with 'sudo pip3 install psutil'.")
+
+# Set up logging
+log_file = "/var/log/linux_auto_update_gui.log"
+q_table_file = "/var/log/linux_auto_update_qtable.pkl"
+try:
+    if not os.path.exists(log_file):
+        with open(log_file, 'a'):
+            os.utime(log_file, None)
+    os.chmod(log_file, 0o666)
+    logging.basicConfig(filename=log_file, level=logging.INFO, format='%(asctime)s - %(message)s')
+except PermissionError as e:
+    print(f"Error: Cannot write to log file '{log_file}'. Please run the script with 'sudo' or change the log file location.")
+    print(f"Details: {e}")
+    exit(1)
+except Exception as e:
+    print(f"Unexpected error setting up logging: {e}")
+    exit(1)
+
+class LinuxAutoUpdateGUI(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Linux Auto Update Tool with Advanced Q-Learning AI")
+        self.geometry("1200x800")
+        self.configure(bg="#f0f0f0")
+
+        # Apply a modern ttk theme
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            style.theme_use("default")
+        style.configure("TButton", font=("Arial", 12))
+        style.configure("TLabel", font=("Arial", 12))
+        style.configure("TNotebook", background="#f0f0f0")
+
+        # Check system compatibility
+        if not self.check_system_compatibility():
+            messagebox.showerror("Compatibility Error", "This script requires a Debian-based system (e.g., Ubuntu, Debian) with internet access.")
+            exit(1)
+
+        # Q-Learning parameters
+        self.commands = [
+            "apt update",              # 0: Update package list
+            "apt full-upgrade",        # 1: Upgrade system
+            "apt autoremove",          # 2: Remove unused packages
+            "check network",           # 3: Check and fix network connectivity
+            "fix dpkg",                # 4: Fix interrupted dpkg operations
+            "fix broken packages",     # 5: Fix broken packages
+            "clear apt locks",         # 6: Clear apt lock files
+            "free disk space",         # 7: Free disk space
+            "repair package db",       # 8: Repair package database
+            "update sources",          # 9: Update /etc/apt/sources.list
+            "remove broken packages",  # 10: Remove broken packages
+            "reinstall apt",           # 11: Reinstall apt and dpkg
+            "manage kernel",           # 12: Remove old kernels to free space
+            "force dependency fix",    # 13: Force remove or reinstall to break dependency loops
+            "remove proton package"    # 14: Remove the Proton package
+        ]
+        self.states = 18
+        self.q_table = np.zeros((self.states, len(self.commands)))
+        self.learning_rate = 0.1
+        self.discount_factor = 0.95
+        self.exploration_rate = 0.7
+        self.min_exploration_rate = 0.01
+        self.exploration_decay = 0.995
+        self.current_state = 0
+        self.current_action = 0
+        self.current_reward = 0.0
+        self.commands_executed = [False] * len(self.commands)
+        self.error_detected = False
+        self.error_type = None
+        self.error_history = []
+        self.fix_broken_failed = False
+        self.attempts = 0
+        self.max_attempts = 5
+        self.reward_history = deque(maxlen=10)
+        self.action_attempts = {}
+
+        # System state variables
+        self.internet_available = self.check_internet()
+        self.package_list_updated = False
+        self.upgrade_completed = False
+        self.broken_packages = False
+        self.dpkg_interrupted = False
+        self.apt_locked = False
+        self.disk_space_low = self.check_disk_space() < 10 if PSUTIL_AVAILABLE else False
+        self.package_db_corrupted = False
+        self.sources_outdated = False
+        self.kernel_update_pending = False
+        self.dependency_loop = False
+        self.apt_broken = False
+        self.dependency_issues = {}
+
+        # Q-table file
+        self.q_table_file = q_table_file
+        self.load_q_table()
+
+        self.setup_ui()
+        self.log_message("Application initialized successfully.")
+
+    def check_system_compatibility(self):
+        try:
+            if not os.path.exists("/etc/debian_version"):
+                self.log_message("System compatibility check failed: Not a Debian-based system.")
+                return False
+            if not self.check_internet():
+                self.log_message("System compatibility check failed: No internet connection.")
+                return False
+            return True
+        except Exception as e:
+            self.log_message(f"Error during system compatibility check: {e}")
+            return False
+
+    def setup_ui(self):
+        title_label = ttk.Label(self, text="🛠️ Linux Auto Update Tool with Advanced Q-Learning AI", font=("Arial", 16, "bold"))
+        title_label.pack(pady=10)
+
+        self.status_var = tk.StringVar(value="Ready")
+        status_bar = ttk.Label(self, textvariable=self.status_var, font=("Arial", 10), relief="sunken", anchor="w")
+        status_bar.pack(side="bottom", fill="x")
+
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(expand=True, fill="both", padx=10, pady=10)
+
+        self.update_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.update_frame, text="Update")
+
+        self.health_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.health_frame, text="System Health")
+
+        self.qtable_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.qtable_frame, text="Q-Table")
+
+        self.logs_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.logs_frame, text="Logs")
+
+        self.suggestions_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.suggestions_frame, text="Smart Suggestions")
+
+        self.setup_update_tab()
+        self.setup_health_tab()
+        self.setup_qtable_tab()
+        self.setup_logs_tab()
+        self.setup_suggestions_tab()
+
+    def setup_update_tab(self):
+        update_controls = ttk.Frame(self.update_frame)
+        update_controls.pack(pady=10, fill="x")
+
+        self.update_button = ttk.Button(update_controls, text="🚀 Start Update", command=self.start_update)
+        self.update_button.pack(side="left", padx=5)
+        self.create_tooltip(self.update_button, "Start the system update process using the AI")
+
+        ttk.Button(update_controls, text="🔄 Reset Q-Table", command=self.reset_q_table).pack(side="left", padx=5)
+
+        fix_frame = ttk.Frame(self.update_frame)
+        fix_frame.pack(pady=5, fill="x")
+
+        ttk.Button(fix_frame, text="🌐 Fix Network", command=lambda: self.manual_fix("check network")).pack(side="left", padx=5)
+        ttk.Button(fix_frame, text="🔧 Fix dpkg", command=lambda: self.manual_fix("fix dpkg")).pack(side="left", padx=5)
+        ttk.Button(fix_frame, text="📦 Fix Broken Packages", command=lambda: self.manual_fix("fix broken packages")).pack(side="left", padx=5)
+        ttk.Button(fix_frame, text="🗑️ Remove Broken Packages", command=lambda: self.manual_fix("remove broken packages")).pack(side="left", padx=5)
+        ttk.Button(fix_frame, text="🔓 Clear apt Locks", command=lambda: self.manual_fix("clear apt locks")).pack(side="left", padx=5)
+        ttk.Button(fix_frame, text="💾 Free Disk Space", command=lambda: self.manual_fix("free disk space")).pack(side="left", padx=5)
+        ttk.Button(fix_frame, text="🛠️ Reinstall apt", command=lambda: self.manual_fix("reinstall apt")).pack(side="left", padx=5)
+        ttk.Button(fix_frame, text="🐧 Manage Kernel", command=lambda: self.manual_fix("manage kernel")).pack(side="left", padx=5)
+        ttk.Button(fix_frame, text="🔗 Force Dependency Fix", command=lambda: self.manual_fix("force dependency fix")).pack(side="left", padx=5)
+        ttk.Button(fix_frame, text="🛡️ Remove Proton Package", command=lambda: self.manual_fix("remove proton package")).pack(side="left", padx=5)
+
+        self.progress = ttk.Progressbar(self.update_frame, orient="horizontal", length=400, mode="determinate")
+        self.progress.pack(pady=10)
+
+        status_frame = ttk.Frame(self.update_frame)
+        status_frame.pack(pady=5, fill="x")
+
+        self.state_label = ttk.Label(status_frame, text="Current State: 0 (Initial)")
+        self.state_label.pack(side="left", padx=5)
+
+        self.action_label = ttk.Label(status_frame, text="Current Action: None")
+        self.action_label.pack(side="left", padx=5)
+
+        self.reward_label = ttk.Label(status_frame, text="Current Reward: 0.00")
+        self.reward_label.pack(side="left", padx=5)
+
+        ttk.Label(self.update_frame, text="Error History", font=("Arial", 12, "bold")).pack(pady=5)
+        self.error_history_text = tk.Text(self.update_frame, width=100, height=5, wrap=tk.WORD, font=("Arial", 10))
+        self.error_history_text.pack(pady=5)
+
+    def setup_health_tab(self):
+        health_frame = ttk.Frame(self.health_frame)
+        health_frame.pack(pady=10, fill="x")
+
+        self.disk_label = ttk.Label(health_frame, text=f"💾 Disk Space: {self.check_disk_space():.1f}% Free" if PSUTIL_AVAILABLE else "💾 Disk Space: N/A")
+        self.disk_label.pack(side="left", padx=10)
+
+        self.network_label = ttk.Label(health_frame, text=f"🌐 Network: {'Online' if self.internet_available else 'Offline'}")
+        self.network_label.pack(side="left", padx=10)
+
+        self.cpu_label = ttk.Label(health_frame, text=f"🖥️ CPU Usage: {psutil.cpu_percent(interval=1):.1f}%" if PSUTIL_AVAILABLE else "🖥️ CPU Usage: N/A")
+        self.cpu_label.pack(side="left", padx=10)
+
+        self.memory_label = ttk.Label(health_frame, text=f"📈 Memory Usage: {psutil.virtual_memory().percent:.1f}%" if PSUTIL_AVAILABLE else "📈 Memory Usage: N/A")
+        self.memory_label.pack(side="left", padx=10)
+
+        self.kernel_label = ttk.Label(health_frame, text=f"🐧 Kernel Update Pending: {'Yes' if self.kernel_update_pending else 'No'}")
+        self.kernel_label.pack(side="left", padx=10)
+
+    def setup_qtable_tab(self):
+        ttk.Label(self.qtable_frame, text="Q-Table (State x Action)", font=("Arial", 12, "bold")).pack(pady=5)
+
+        self.q_table_labels = []
+        scroll_frame = ttk.Frame(self.qtable_frame)
+        scroll_frame.pack(expand=True, fill="both")
+
+        canvas = tk.Canvas(scroll_frame)
+        scrollbar = ttk.Scrollbar(scroll_frame, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+
+        header_frame = ttk.Frame(scrollable_frame)
+        header_frame.pack(fill="x")
+        ttk.Label(header_frame, text="State", width=10).pack(side="left")
+        for cmd in self.commands:
+            ttk.Label(header_frame, text=cmd, width=20, font=("Arial", 8)).pack(side="left")
+
+        for i in range(self.states):
+            row_frame = ttk.Frame(scrollable_frame)
+            row_frame.pack(fill="x")
+            ttk.Label(row_frame, text=f"State {i}", width=10).pack(side="left")
+            row_labels = []
+            for j in range(len(self.commands)):
+                label = ttk.Label(row_frame, text="0.00", width=20, background="#FF0000")
+                label.pack(side="left")
+                row_labels.append(label)
+            self.q_table_labels.append(row_labels)
+
+    def setup_logs_tab(self):
+        self.output_text = tk.Text(self.logs_frame, width=100, height=20, wrap=tk.WORD, font=("Arial", 10))
+        self.output_text.pack(pady=10, expand=True, fill="both")
+        self.output_text.insert(tk.END, "Click 'Start Update' in the Update tab to begin...\n")
+
+    def setup_suggestions_tab(self):
+        ttk.Label(self.suggestions_frame, text="Smart Suggestions", font=("Arial", 12, "bold")).pack(pady=5)
+        self.suggestions_text = tk.Text(self.suggestions_frame, width=100, height=20, wrap=tk.WORD, font=("Arial", 10))
+        self.suggestions_text.pack(pady=10, expand=True, fill="both")
+        self.suggestions_text.insert(tk.END, "Suggestions will appear here after analyzing the system state...\n")
+        ttk.Button(self.suggestions_frame, text="Refresh Suggestions", command=self.update_suggestions).pack(pady=5)
+
+    def create_tooltip(self, widget, text):
+        def enter(event):
+            x, y = widget.winfo_rootx() + 20, widget.winfo_rooty() + 20
+            self.tooltip = tk.Toplevel(widget)
+            self.tooltip.wm_overrideredirect(True)
+            self.tooltip.wm_geometry(f"+{x}+{y}")
+            label = ttk.Label(self.tooltip, text=text, background="yellow", relief="solid", borderwidth=1)
+            label.pack()
+
+        def leave(event):
+            if hasattr(self, 'tooltip'):
+                self.tooltip.destroy()
+
+        widget.bind("<Enter>", enter)
+        widget.bind("<Leave>", leave)
+
+    def log_message(self, message):
+        try:
+            self.output_text.insert(tk.END, f"[{time.strftime('%H:%M:%S')}] {message}\n")
+            self.output_text.see(tk.END)
+            self.output_text.update_idletasks()
+            logging.info(message)
+        except Exception as e:
+            print(f"Error logging message: {e}")
+
+    def update_error_history(self, error_type):
+        try:
+            if error_type:
+                timestamp = datetime.now().strftime("%H:%M:%S")
+                self.error_history.append(f"[{timestamp}] {error_type}")
+                self.error_history_text.delete(1.0, tk.END)
+                self.error_history_text.insert(tk.END, "\n".join(self.error_history[-5:]))
+                self.error_history_text.see(tk.END)
+        except Exception as e:
+            self.log_message(f"Error updating error history: {e}")
+
+    def update_system_health(self):
+        try:
+            self.disk_space_low = self.check_disk_space() < 10 if PSUTIL_AVAILABLE else False
+            self.internet_available = self.check_internet()
+            self.disk_label.config(text=f"💾 Disk Space: {self.check_disk_space():.1f}% Free" if PSUTIL_AVAILABLE else "💾 Disk Space: N/A")
+            self.network_label.config(text=f"🌐 Network: {'Online' if self.internet_available else 'Offline'}")
+            if PSUTIL_AVAILABLE:
+                self.cpu_label.config(text=f"🖥️ CPU Usage: {psutil.cpu_percent(interval=1):.1f}%")
+                self.memory_label.config(text=f"📈 Memory Usage: {psutil.virtual_memory().percent:.1f}%")
+            self.kernel_label.config(text=f"🐧 Kernel Update Pending: {'Yes' if self.kernel_update_pending else 'No'}")
+            self.update_idletasks()
+        except Exception as e:
+            self.log_message(f"Error updating system health: {e}")
+
+    def check_internet(self):
+        try:
+            socket.create_connection(("8.8.8.8", 53), timeout=3)
+            return True
+        except OSError as e:
+            self.log_message(f"Internet check failed: {e}")
+            return False
+
+    def check_disk_space(self):
+        if not PSUTIL_AVAILABLE:
+            return 100.0
+        try:
+            stat = psutil.disk_usage('/')
+            return (stat.free / stat.total) * 100
+        except Exception as e:
+            self.log_message(f"Error checking disk space: {e}")
+            return 100.0
+
+    def check_apt_lock(self):
+        try:
+            lock_files = ["/var/lib/dpkg/lock-frontend", "/var/lib/apt/lists/lock"]
+            for lock_file in lock_files:
+                if os.path.exists(lock_file):
+                    return True
+            return False
+        except Exception as e:
+            self.log_message(f"Error checking apt lock: {e}")
+            return False
+
+    def identify_broken_packages(self):
+        broken_packages = []
+        self.dependency_issues = {}
+        try:
+            result = subprocess.run("dpkg -l | grep ^rc", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if result.stdout:
+                for line in result.stdout.splitlines():
+                    parts = line.split()
+                    if len(parts) > 1:
+                        broken_packages.append(parts[1])
+                        self.log_message(f"Identified residual package: {parts[1]}")
+
+            result = subprocess.run("sudo apt update", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if result.stderr:
+                for line in result.stderr.splitlines():
+                    if "is in a very bad inconsistent state" in line:
+                        parts = line.split()
+                        package = parts[1] if len(parts) > 1 else None
+                        if package:
+                            broken_packages.append(package)
+                            self.log_message(f"Identified inconsistent package: {package}")
+        except Exception as e:
+            self.log_message(f"Error identifying broken packages: {e}")
+        return list(set(broken_packages))
+
+    def check_proton_package(self):
+        try:
+            result = subprocess.run("dpkg -l | grep proton", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if "proton" in result.stdout.lower():
+                self.log_message("Proton package detected.")
+                return True
+            return False
+        except Exception as e:
+            self.log_message(f"Error checking for Proton package: {e}")
+            return False
+
+    def run_command(self, command):
+        self.status_var.set(f"Running: {command}")
+        self.log_message(f"Attempting to run command: {command}")
+
+        try:
+            if command == "check network":
+                self.internet_available = self.check_internet()
+                if not self.internet_available:
+                    subprocess.run("sudo systemctl restart NetworkManager || sudo systemctl restart networking", shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    time.sleep(5)
+                    self.internet_available = self.check_internet()
+                return self.internet_available, None
+            elif command == "fix dpkg":
+                result = subprocess.run("sudo dpkg --configure -a", shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                self.dpkg_interrupted = False
+                self.fix_broken_failed = False
+                return True, None
+            elif command == "fix broken packages":
+                result = subprocess.run("sudo apt --fix-broken install -y", shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                self.broken_packages = False
+                self.fix_broken_failed = False
+                return True, None
+            elif command == "clear apt locks":
+                lock_files = ["/var/lib/dpkg/lock-frontend", "/var/lib/apt/lists/lock"]
+                for lock_file in lock_files:
+                    if os.path.exists(lock_file):
+                        subprocess.run(f"sudo rm -f {lock_file}", shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                subprocess.run("sudo dpkg --configure -a", shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                self.apt_locked = False
+                self.fix_broken_failed = False
+                return True, None
+            elif command == "free disk space":
+                subprocess.run("sudo apt clean", shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                self.disk_space_low = self.check_disk_space() < 10
+                self.fix_broken_failed = False
+                return not self.disk_space_low, None
+            elif command == "repair package db":
+                subprocess.run("sudo rm -rf /var/lib/apt/lists/*", shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                subprocess.run("sudo apt update", shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                self.package_db_corrupted = False
+                self.fix_broken_failed = False
+                return True, None
+            elif command == "update sources":
+                subprocess.run("sudo cp /etc/apt/sources.list /etc/apt/sources.list.bak", shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                sources_files = ["/etc/apt/sources.list"] + [f"/etc/apt/sources.list.d/{f}" for f in os.listdir("/etc/apt/sources.list.d") if f.endswith(".list")]
+                for source_file in sources_files:
+                    try:
+                        with open(source_file, 'r') as f:
+                            lines = f.readlines()
+                        with open(source_file, 'w') as f:
+                            for line in lines:
+                                line = line.strip()
+                                if line and not line.startswith("#"):
+                                    parts = line.split()
+                                    if parts and parts[0] not in ["deb", "deb-src"]:
+                                        line = line.replace(parts[0], "deb")
+                                f.write(line + "\n")
+                    except Exception as e:
+                        self.log_message(f"Error updating sources file {source_file}: {e}")
+                subprocess.run("sudo apt update", shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                self.sources_outdated = False
+                self.fix_broken_failed = False
+                return True, None
+            elif command == "remove broken packages":
+                broken_packages = self.identify_broken_packages()
+                if not broken_packages:
+                    self.log_message("No broken packages found to remove.")
+                    return True, None
+                for package in broken_packages:
+                    self.log_message(f"Removing broken package: {package}")
+                    subprocess.run(f"sudo apt remove --purge -y {package}", shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    subprocess.run(f"sudo dpkg --purge {package}", shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                subprocess.run("sudo apt autoremove -y", shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                subprocess.run("sudo apt autoclean", shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                self.broken_packages = False
+                self.fix_broken_failed = False
+                return True, None
+            elif command == "reinstall apt":
+                self.log_message("Reinstalling apt and dpkg...")
+                try:
+                    subprocess.run("sudo apt download apt dpkg", shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    subprocess.run("sudo dpkg -i apt*.deb dpkg*.deb", shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                except subprocess.CalledProcessError as e:
+                    self.log_message("apt download failed, attempting manual download...")
+                    distro = "debian"
+                    if os.path.exists("/etc/debian_version"):
+                        with open("/etc/debian_version", 'r') as f:
+                            version = f.read().strip().split('.')[0]
+                        distro_version = f"debian/{version}"
+                    else:
+                        distro_version = "Ubuntu/jammy"
+                    apt_url = f"https://deb.debian.org/debian/pool/main/a/apt/apt_2.6.1_{distro_version}_amd64.deb"
+                    dpkg_url = f"https://deb.debian.org/debian/pool/main/d/dpkg/dpkg_1.21.22_{distro_version}_amd64.deb"
+                    subprocess.run(f"wget -O apt.deb {apt_url}", shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    subprocess.run(f"wget -O dpkg.deb {dpkg_url}", shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    subprocess.run("sudo dpkg -i apt.deb dpkg.deb", shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    subprocess.run("rm apt.deb dpkg.deb", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                subprocess.run("sudo apt update", shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                self.apt_broken = False
+                self.fix_broken_failed = False
+                return True, None
+            elif command == "manage kernel":
+                self.log_message("Removing old kernels to free space...")
+                subprocess.run("sudo apt autoremove --purge -y", shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                subprocess.run("sudo update-grub", shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                self.kernel_update_pending = False
+                self.disk_space_low = self.check_disk_space() < 10
+                return True, None
+            elif command == "force dependency fix":
+                broken_packages = self.identify_broken_packages()
+                if not broken_packages:
+                    self.log_message("No broken packages found for dependency fix.")
+                    return True, None
+                for package in broken_packages:
+                    self.log_message(f"Forcing removal of {package} to break dependency loop...")
+                    subprocess.run(f"sudo dpkg --remove --force-all {package}", shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    subprocess.run(f"sudo apt install -y {package}", shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                subprocess.run("sudo apt autoremove -y", shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                self.dependency_loop = False
+                self.broken_packages = False
+                self.fix_broken_failed = False
+                return True, None
+            elif command == "remove proton package":
+                self.log_message("Removing Proton package (e.g., protonvpn)...")
+                subprocess.run("sudo apt remove --purge -y protonvpn proton-vpn-gnome-desktop", shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                subprocess.run("sudo dpkg --purge protonvpn proton-vpn-gnome-desktop", shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                subprocess.run("sudo apt autoremove -y", shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                subprocess.run("sudo apt autoclean", shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                self.fix_broken_failed = False
+                return True, None
+            else:
+                result = subprocess.run(f"sudo {command} -y", shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                self.fix_broken_failed = False
+                return result.stdout, None
+        except subprocess.CalledProcessError as e:
+            stderr = e.stderr if e.stderr is not None else ""
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode('utf-8', errors='ignore')
+            self.log_message(f"Command failed: {command}, Error: {stderr}")
+            if "Could not resolve" in stderr or "Failed to fetch" in stderr:
+                self.error_detected = True
+                self.error_type = "network"
+                self.internet_available = False
+            elif "dpkg was interrupted" in stderr:
+                self.error_detected = True
+                self.error_type = "dpkg_interrupted"
+                self.dpkg_interrupted = True
+            elif "unmet dependencies" in stderr or "depends on" in stderr:
+                self.error_detected = True
+                self.error_type = "broken_packages"
+                self.broken_packages = True
+                if command == "fix broken packages":
+                    self.fix_broken_failed = True
+                if "dependency problems - leaving unconfigured" in stderr:
+                    self.dependency_loop = True
+            elif "Could not get lock" in stderr or "E: Could not open lock file" in stderr:
+                self.error_detected = True
+                self.error_type = "apt_lock"
+                self.apt_locked = True
+            elif "No space left on device" in stderr:
+                self.error_detected = True
+                self.error_type = "disk_space"
+                self.disk_space_low = True
+            elif "corrupted package database" in stderr or "database disk image is malformed" in stderr:
+                self.error_detected = True
+                self.error_type = "package_db"
+                self.package_db_corrupted = True
+            elif "404 Not Found" in stderr or "source repository is not available" in stderr or "Type" in stderr or "Signed-By" in stderr or "The list of sources could not be read" in stderr:
+                self.error_detected = True
+                self.error_type = "sources"
+                self.sources_outdated = True
+            elif "is in a very bad inconsistent state" in stderr:
+                self.error_detected = True
+                self.error_type = "broken_packages"
+                self.broken_packages = True
+                if command == "fix broken packages":
+                    self.fix_broken_failed = True
+            elif "kernel" in stderr and "update" in stderr:
+                self.error_detected = True
+                self.error_type = "kernel_update"
+                self.kernel_update_pending = True
+            elif "apt" in stderr and "not found" in stderr:
+                self.error_detected = True
+                self.error_type = "apt_broken"
+                self.apt_broken = True
+            self.update_error_history(self.error_type)
+            return None, stderr
+        except Exception as e:
+            self.log_message(f"Unexpected error in run_command: {e}")
+            return None, str(e)
+        finally:
+            self.status_var.set("Ready")
+
+    def get_state(self):
+        try:
+            if not self.internet_available:
+                return 4
+            if self.dpkg_interrupted:
+                return 5
+            if self.broken_packages:
+                if self.fix_broken_failed:
+                    return 6
+                return 6
+            if self.apt_locked:
+                return 7
+            if self.disk_space_low:
+                return 8
+            if self.package_db_corrupted:
+                return 9
+            if self.sources_outdated:
+                return 10
+            if self.kernel_update_pending:
+                return 11
+            if self.dependency_loop:
+                return 12
+            if self.apt_broken:
+                return 13
+            if self.check_proton_package():
+                return 14
+            if self.error_detected and self.error_type:
+                return 15
+            if self.commands_executed[0] and self.commands_executed[1] and self.commands_executed[2]:
+                return 3
+            if self.commands_executed[1]:
+                return 2
+            if self.commands_executed[0]:
+                return 1
+            if sum(self.commands_executed[:3]) == 0 and self.error_detected:
+                return 16
+            if len(self.error_history) > 3:
+                return 17
+            return 0
+        except Exception as e:
+            self.log_message(f"Error in get_state: {e}")
+            return 0
+
+    def choose_action(self):
+        try:
+            avg_reward = np.mean(self.reward_history) if self.reward_history else 0
+            if avg_reward < 0:
+                self.exploration_rate = min(0.9, self.exploration_rate + 0.05)
+            elif avg_reward > 0.5:
+                self.exploration_rate = max(self.min_exploration_rate, self.exploration_rate - 0.05)
+
+            available_actions = list(range(len(self.commands)))
+            for action in list(self.action_attempts.keys()):
+                if self.action_attempts[action] >= 3:
+                    if action in available_actions:
+                        available_actions.remove(action)
+
+            if not available_actions:
+                self.log_message("All actions have been attempted too many times. Resetting attempts.")
+                self.action_attempts.clear()
+                available_actions = list(range(len(self.commands)))
+
+            if random.random() < self.exploration_rate:
+                return random.choice(available_actions)
+            else:
+                q_values = self.q_table[self.current_state].copy()
+                for action in range(len(self.commands)):
+                    if action not in available_actions:
+                        q_values[action] = -float('inf')
+                return np.argmax(q_values)
+        except Exception as e:
+            self.log_message(f"Error in choose_action: {e}")
+            return random.randint(0, len(self.commands) - 1)
+
+    def calculate_reward(self, command_idx, success):
+        try:
+            reward = 0.0
+            if self.current_state in [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]:
+                reward -= 0.5
+            if self.current_state == 17:
+                reward -= 0.3
+
+            if command_idx == 0:
+                if not self.internet_available or self.sources_outdated:
+                    reward = -1.0
+                elif self.apt_locked or self.disk_space_low:
+                    reward = -0.7
+                elif success:
+                    reward = 1.0
+                    self.package_list_updated = True
+                else:
+                    reward = -0.5
+            elif command_idx == 1:
+                if not self.internet_available or self.sources_outdated:
+                    reward = -1.0
+                elif self.apt_locked or self.disk_space_low:
+                    reward = -0.7
+                elif not self.package_list_updated:
+                    reward = -0.8
+                elif self.dpkg_interrupted or self.broken_packages:
+                    reward = -0.7
+                elif success:
+                    reward = 1.5
+                    self.upgrade_completed = True
+                else:
+                    reward = -0.5
+            elif command_idx == 2:
+                if not self.upgrade_completed:
+                    reward = -0.3
+                elif self.apt_locked or self.disk_space_low:
+                    reward = -0.7
+                elif success:
+                    reward = 0.5
+                else:
+                    reward = -0.2
+            elif command_idx == 3:
+                if self.current_state != 4:
+                    reward = -0.2
+                elif success:
+                    reward = 1.0
+                    self.error_detected = False
+                    self.error_type = None
+                else:
+                    reward = -0.5
+            elif command_idx == 4:
+                if self.current_state != 5:
+                    reward = -0.2
+                elif success:
+                    reward = 1.0
+                    self.error_detected = False
+                    self.error_type = None
+                else:
+                    reward = -0.5
+            elif command_idx == 5:
+                if self.current_state != 6:
+                    reward = -0.2
+                elif success:
+                    reward = 1.0
+                    self.error_detected = False
+                    self.error_type = None
+                else:
+                    reward = -0.5
+            elif command_idx == 6:
+                if self.current_state != 7:
+                    reward = -0.2
+                elif success:
+                    reward = 1.0
+                    self.error_detected = False
+                    self.error_type = None
+                else:
+                    reward = -0.5
+            elif command_idx == 7:
+                if self.current_state != 8:
+                    reward = -0.2
+                elif success:
+                    reward = 1.0
+                    self.error_detected = False
+                    self.error_type = None
+                else:
+                    reward = -0.5
+            elif command_idx == 8:
+                if self.current_state != 9:
+                    reward = -0.2
+                elif success:
+                    reward = 1.0
+                    self.error_detected = False
+                    self.error_type = None
+                else:
+                    reward = -0.5
+            elif command_idx == 9:
+                if self.current_state != 10:
+                    reward = -0.2
+                elif success:
+                    reward = 1.0
+                    self.error_detected = False
+                    self.error_type = None
+                else:
+                    reward = -0.5
+            elif command_idx == 10:
+                if self.current_state != 6 or not self.fix_broken_failed:
+                    reward = -0.2
+                elif success:
+                    reward = 1.2
+                    self.error_detected = False
+                    self.error_type = None
+                else:
+                    reward = -0.5
+            elif command_idx == 11:
+                if self.current_state not in [13]:
+                    reward = -0.5
+                elif success:
+                    reward = 1.5
+                    self.error_detected = False
+                    self.error_type = None
+                else:
+                    reward = -0.5
+            elif command_idx == 12:
+                if self.current_state not in [11, 8]:
+                    reward = -0.2
+                elif success:
+                    reward = 1.0
+                    self.error_detected = False
+                    self.error_type = None
+                else:
+                    reward = -0.5
+            elif command_idx == 13:
+                if self.current_state not in [12, 6]:
+                    reward = -0.2
+                elif success:
+                    reward = 1.2
+                    self.error_detected = False
+                    self.error_type = None
+                else:
+                    reward = -0.5
+            elif command_idx == 14:
+                if self.current_state != 14:
+                    reward = -0.2
+                elif success:
+                    reward = 1.2
+                    self.error_detected = False
+                    self.error_type = None
+                else:
+                    reward = -0.5
+
+            if self.commands_executed[command_idx] and command_idx in [0, 1, 2]:
+                reward -= 0.2
+
+            self.reward_history.append(reward)
+            return reward
+        except Exception as e:
+            self.log_message(f"Error in calculate_reward: {e}")
+            return 0.0
+
+    def load_q_table(self):
+        if os.path.exists(self.q_table_file):
+            try:
+                with open(self.q_table_file, 'rb') as f:
+                    loaded_q_table = pickle.load(f)
+                    if loaded_q_table.shape == self.q_table.shape:
+                        self.q_table = loaded_q_table
+                        self.log_message("Loaded Q-table from previous runs.")
+            except Exception as e:
+                self.log_message(f"Failed to load Q-table: {e}")
+
+    def save_q_table(self):
+        try:
+            with open(self.q_table_file, 'wb') as f:
+                pickle.dump(self.q_table, f)
+            self.log_message("Saved Q-table for future runs.")
+            os.chmod(self.q_table_file, 0o666)
+        except Exception as e:
+            self.log_message(f"Failed to save Q-table: {e}")
+
+    def reset_q_table(self):
+        try:
+            self.q_table = np.zeros((self.states, len(self.commands)))
+            self.log_message("Q-table reset to zeros.")
+            self.update_q_table_display()
+        except Exception as e:
+            self.log_message(f"Error in reset_q_table: {e}")
+
+    def manual_fix(self, command):
+        self.status_var.set(f"Manually running: {command}")
+        threading.Thread(target=self.execute_manual_fix, args=(command,), daemon=True).start()
+
+    def execute_manual_fix(self, command):
+        try:
+            self.update_button.config(state="disabled")
+            idx = self.commands.index(command)
+            success, error = self.run_command(command)
+            if success:
+                self.commands_executed[idx] = True
+                self.action_attempts[idx] = 0
+                self.log_message(f"Manual fix '{command}' executed successfully.")
+            else:
+                self.action_attempts[idx] = self.action_attempts.get(idx, 0) + 1
+                self.log_message(f"Manual fix '{command}' failed: {error}")
+            self.update_system_health()
+            self.update_suggestions()
+            self.update_button.config(state="normal")
+            self.status_var.set("Ready")
+        except Exception as e:
+            self.log_message(f"Error in execute_manual_fix: {e}")
+            self.update_button.config(state="normal")
+            self.status_var.set("Ready")
+
+    def update_q_table(self):
+        try:
+            old_q_value = self.q_table[self.current_state, self.current_action]
+            future_q_value = np.max(self.q_table[self.current_state])
+            new_q_value = old_q_value + self.learning_rate * (self.current_reward + self.discount_factor * future_q_value - old_q_value)
+            self.q_table[self.current_state, self.current_action] = new_q_value
+            self.update_q_table_display()
+            self.log_message(f"Updated Q-table: State {self.current_state}, Action {self.current_action}, Reward {self.current_reward:.2f}, New Q-value {new_q_value:.2f}")
+        except Exception as e:
+            self.log_message(f"Error in update_q_table: {e}")
+
+    def update_q_table_display(self):
+        try:
+            max_q = np.max(self.q_table) if np.max(self.q_table) != 0 else 1
+            for i in range(self.states):
+                for j in range(len(self.commands)):
+                    q_value = self.q_table[i, j]
+                    intensity = int(255 * (q_value / max_q)) if max_q != 0 else 0
+                    intensity = max(0, min(255, intensity))
+                    blue_component = 255 - intensity
+                    blue_component = max(0, min(255, blue_component))
+                    color = f"#{intensity:02x}FF{blue_component:02x}"
+                    self.q_table_labels[i][j].config(text=f"{q_value:.2f}", background=color)
+        except Exception as e:
+            self.log_message(f"Error in update_q_table_display: {e}")
+
+    def update_status_labels(self):
+        try:
+            state_descriptions = {
+                0: "Initial", 1: "Package List Updated", 2: "Upgrade Completed", 3: "All Done",
+                4: "Network Error", 5: "dpkg Interrupted", 6: "Broken Packages", 7: "apt Lock Issue",
+                8: "Disk Space Low", 9: "Package DB Corrupted", 10: "Sources Outdated",
+                11: "Kernel Update Pending", 12: "Dependency Loop", 13: "apt Broken",
+                14: "Proton Package Detected", 15: "Generic Error", 16: "Initial with Error",
+                17: "Frequent Errors"
+            }
+            self.state_label.config(text=f"Current State: {self.current_state} ({state_descriptions[self.current_state]})")
+            self.action_label.config(text=f"Current Action: {self.commands[self.current_action]}")
+            self.reward_label.config(text=f"Current Reward: {self.current_reward:.2f}")
+            self.update_idletasks()
+        except Exception as e:
+            self.log_message(f"Error in update_status_labels: {e}")
+
+    def update_suggestions(self):
+        try:
+            self.suggestions_text.delete(1.0, tk.END)
+            self.current_state = self.get_state()
+            state_descriptions = {
+                0: "Initial", 1: "Package List Updated", 2: "Upgrade Completed", 3: "All Done",
+                4: "Network Error", 5: "dpkg Interrupted", 6: "Broken Packages", 7: "apt Lock Issue",
+                8: "Disk Space Low", 9: "Package DB Corrupted", 10: "Sources Outdated",
+                11: "Kernel Update Pending", 12: "Dependency Loop", 13: "apt Broken",
+                14: "Proton Package Detected", 15: "Generic Error", 16: "Initial with Error",
+                17: "Frequent Errors"
+            }
+            self.suggestions_text.insert(tk.END, f"Current State: {state_descriptions[self.current_state]}\n\n")
+            
+            q_values = self.q_table[self.current_state].copy()
+            top_actions = np.argsort(q_values)[-3:][::-1]
+            self.suggestions_text.insert(tk.END, "Suggested Actions:\n")
+            for action in top_actions:
+                if q_values[action] > -float('inf'):
+                    self.suggestions_text.insert(tk.END, f"- {self.commands[action]} (Q-value: {q_values[action]:.2f})\n")
+        except Exception as e:
+            self.log_message(f"Error in update_suggestions: {e}")
+            self.suggestions_text.delete(1.0, tk.END)
+            self.suggestions_text.insert(tk.END, "Error generating suggestions. Check logs for details.\n")
+
+    def start_update(self):
+        try:
+            self.update_button.config(state="disabled")
+            self.commands_executed = [False] * len(self.commands)
+            self.package_list_updated = False
+            self.upgrade_completed = False
+            self.broken_packages = False
+            self.dpkg_interrupted = False
+            self.apt_locked = False
+            self.disk_space_low = False
+            self.package_db_corrupted = False
+            self.sources_outdated = False
+            self.kernel_update_pending = False
+            self.dependency_loop = False
+            self.apt_broken = False
+            self.error_detected = False
+            self.error_type = None
+            self.fix_broken_failed = False
+            self.attempts = 0
+            self.action_attempts.clear()
+            self.reward_history.clear()
+            self.dependency_issues.clear()
+            self.progress['value'] = 0
+            self.log_message("Starting system update with Advanced Q-Learning AI...")
+            threading.Thread(target=self.ai_update_loop, daemon=True).start()
+        except Exception as e:
+            self.log_message(f"Error in start_update: {e}")
+            self.update_button.config(state="normal")
+
+    def ai_update_loop(self):
+        steps = 0
+        max_steps = 50
+        total_tasks = 3 + len(self.error_history)
+        while steps < max_steps and sum(self.commands_executed[:3]) < 3:
+            try:
+                self.current_state = self.get_state()
+                if self.current_state == 3:
+                    break
+
+                self.update_system_health()
+                self.update_suggestions()
+
+                self.current_action = self.choose_action()
+                command = self.commands[self.current_action]
+                self.update_status_labels()
+                self.log_message(f"AI chose action: {command} (State: {self.current_state}, Exploration Rate: {self.exploration_rate:.2f})")
+
+                self.log_message(f"Executing: {command}")
+                success, error = self.run_command(command)
+                if success:
+                    self.commands_executed[self.current_action] = True
+                    self.attempts = 0
+                    self.action_attempts[self.current_action] = 0
+                    if command in ["apt update", "apt full-upgrade", "apt autoremove"]:
+                        self.log_message(f"Command output:\n{success}\n{command} executed successfully.")
+                    else:
+                        self.log_message(f"{command} executed successfully.")
+                else:
+                    self.attempts += 1
+                    self.action_attempts[self.current_action] = self.action_attempts.get(self.current_action, 0) + 1
+                    self.log_message(f"Command error:\n{error}\nError occurred while executing {command}.")
+                    if command in ["fix dpkg", "fix broken packages", "clear apt locks", "free disk space", "repair package db", "update sources", "remove broken packages", "reinstall apt", "manage kernel", "force dependency fix", "remove proton package"]:
+                        self.log_message("Fix failed. Increasing exploration to try alternative fix.")
+                        self.exploration_rate = min(0.9, self.exploration_rate + 0.1)
+
+                self.current_reward = self.calculate_reward(self.current_action, success is not None)
+                self.update_status_labels()
+                self.update_q_table()
+
+                self.exploration_rate = max(self.min_exploration_rate, self.exploration_rate * self.exploration_decay)
+                self.log_message(f"Exploration rate: {self.exploration_rate:.2f}")
+
+                progress_value = (sum(self.commands_executed[:3]) + sum(1 for i in range(3, len(self.commands)) if self.commands_executed[i])) / total_tasks * 100
+                self.progress['value'] = progress_value
+                self.update_idletasks()
+
+                steps += 1
+                time.sleep(1)
+            except Exception as e:
+                self.log_message(f"Error in ai_update_loop: {e}")
+                break
+
+        if sum(self.commands_executed[:3]) == 3:
+            self.log_message("System update process completed successfully.")
+        else:
+            self.log_message("System update process failed to complete all steps.")
+        self.save_q_table()
+        self.update_button.config(state="normal")
+
+if __name__ == "__main__":
+    app = LinuxAutoUpdateGUI()
+    app.mainloop()
