@@ -1,0 +1,23 @@
+Linux Auto Update Tool with Advanced Q-Learning AI is a smart update manager designed for Linux systems. It uses Q-learning, a form of reinforcement learning AI, to decide the best times to check for, download, and install updates — learning from system usage patterns over time.
+
+This means your system stays updated without interrupting your workflow, balancing performance, security, and convenience.
+
+An intelligent auto-update manager for Linux systems powered by Q-Learning AI.
+This tool learns your system’s behavior and optimizes when and how updates are applied — reducing interruptions while keeping your machine secure and efficient.
+Features
+
+    Q-Learning AI adapts update timing based on system usage
+
+    Lightweight and efficient
+
+    Compatible with most Linux distros
+
+    No user input required once configured
+
+License
+
+This project is licensed under the Creative Commons Attribution-NoDerivs 4.0 International License.
+You are free to use and share this software, but you may not modify or distribute altered versions.
+
+More info: CC BY-ND 4.0
+Built for stability and simplicity, this tool is distributed 
